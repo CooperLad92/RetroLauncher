@@ -3,6 +3,10 @@
 
     <!-- Needed for the UNINSTALL option in the long-press menu -->
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <!-- RADIO skin: grid reference (coarse, 1 km) -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- SPECTRUM skin: Wi-Fi signal strength meter -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- Android 11+ package visibility: lets the launcher see every launchable app -->
     <queries>
