@@ -24,7 +24,7 @@ final class Skins {
 
     static final String[] NAMES = {
             "GREEN", "AMBER", "64", "NEON", "ICE",
-            "RADIO", "SPECTRUM", "TELETEXT", "LCD", "DESKTOP", "MAINFRAME", "CARTOON", "CRITTER"};
+            "RADIO", "SPECTRUM", "TELETEXT", "LCD", "DESKTOP", "MAINFRAME", "CARTOON", "CRITTER", "VHS"};
 
     static Skin create(String name) {
         String n = name == null ? "GREEN" : name.toUpperCase(Locale.US);
@@ -41,6 +41,7 @@ final class Skins {
             case "MAINFRAME": return new Mainframe();
             case "CARTOON": return new Cartoon();
             case "CRITTER": return new Critter();
+            case "VHS": return new Terminal("VHS", 0xFFFF3DA5, 0xFF0B0716, 0xFF000000, false); // own home screen: see VhsHome
             default: return new Terminal("GREEN", 0xFF33FF66, 0xFF03170A, 0xFF010804, false);
         }
     }
