@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Little CRT monitor with a ">_" prompt -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="27" android:viewportHeight="27">
+    <path android:fillColor="#03170A" android:pathData="M0,0h27v27h-27z" />
+    <path android:fillColor="#33FF66" android:pathData="M5,5h17v14h-17z" />
+    <path android:fillColor="#03170A" android:pathData="M6,6h15v12h-15z" />
+    <path android:fillColor="#33FF66"
+        android:pathData="M8,9h1v1h-1z M9,10h1v1h-1z M10,11h1v1h-1z M9,12h1v1h-1z M8,13h1v1h-1z M12,13h4v1h-4z" />
+    <path android:fillColor="#33FF66" android:pathData="M11,19h5v2h-5z M8,21h11v1h-11z" />
+</vector>
