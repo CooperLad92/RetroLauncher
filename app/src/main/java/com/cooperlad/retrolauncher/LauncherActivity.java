@@ -128,6 +128,7 @@ public class LauncherActivity extends Activity {
     private CrtOverlayView overlay;
     private final TextView[] keys = new TextView[5];
     private AppAdapter adapter;
+    private VhsHome vhs; // VHS store mode has its own home screen
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -137,6 +138,19 @@ public class LauncherActivity extends Activity {
         prefs = getSharedPreferences("retro", MODE_PRIVATE);
         skin = Skins.create(prefs.getString("skin", prefs.getString("theme", "GREEN")));
         loadFont();
+        if ("VHS".equals(skin.name)) {
+            vhs = new VhsHome(this, prefs);
+            setContentView(vhs.root);
+            getWindow().setStatusBarColor(0);
+            getWindow().setNavigationBarColor(0);
+            IntentFilter vf = new IntentFilter();
+            vf.addAction(Intent.ACTION_PACKAGE_ADDED);
+            vf.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            vf.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            vf.addDataScheme("package");
+            listen(packageReceiver, vf);
+            return;
+        }
         buildUi();
 
         IntentFilter pf = new IntentFilter();
@@ -158,6 +172,11 @@ public class LauncherActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        if (vhs != null) {
+            listen(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            vhs.onResume();
+            return;
+        }
         listen(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (appsDirty) loadApps();
         refreshFooter();
@@ -175,6 +194,11 @@ public class LauncherActivity extends Activity {
 
     @Override protected void onPause() {
         super.onPause();
+        if (vhs != null) {
+            try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) { }
+            vhs.onPause();
+            return;
+        }
         try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) { }
         h.removeCallbacks(tick);
         overlay.setRunning(false);
@@ -187,11 +211,13 @@ public class LauncherActivity extends Activity {
         try { unregisterReceiver(packageReceiver); } catch (Exception ignored) { }
         iconExec.shutdownNow();
         h.removeCallbacksAndMessages(null);
+        if (vhs != null) vhs.onDestroy();
     }
 
     /** Home pressed while already home: reset to a clean prompt. */
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (vhs != null) { vhs.onHome(); return; }
         hideSaver();
         dismissMenu();
         input.setText("");
@@ -202,6 +228,7 @@ public class LauncherActivity extends Activity {
     @Override public void onBackPressed() { goBack(); }
 
     @Override public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (vhs != null) return super.dispatchTouchEvent(ev);
         lastTouch = SystemClock.uptimeMillis();
         if (saver != null) {
             if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) hideSaver();
@@ -218,6 +245,7 @@ public class LauncherActivity extends Activity {
 
     private final BroadcastReceiver packageReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
+            if (vhs != null) { vhs.reload(); return; }
             appsDirty = true;
             loadApps();
         }
@@ -230,6 +258,7 @@ public class LauncherActivity extends Activity {
             info.battery = lvl < 0 ? -1 : Math.round(lvl * 100f / scale);
             int st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
             info.charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+            if (vhs != null) { vhs.onBattery(info.battery, info.charging); return; }
             estimateDrain();
             updateStatus();
         }
@@ -374,6 +403,7 @@ public class LauncherActivity extends Activity {
     }
 
     void goBack() {
+        if (vhs != null) { vhs.back(); return; }
         if (menuOverlay != null) { dismissMenu(); return; }
         if (input.length() > 0) { input.setText(""); return; }
         hideKeyboard();
@@ -383,6 +413,30 @@ public class LauncherActivity extends Activity {
     void cycleSkin() { switchSkin(Skins.next(skin.name)); }
 
     void openSystemMenu() { systemMenu(); }
+
+    void switchSkinTo(String name) { switchSkin(name); }
+
+    boolean startComponent(ComponentName cn) {
+        return startQuiet(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(cn)
+                .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED));
+    }
+
+    boolean openQuietly(Intent i) { return startQuiet(i); }
+
+    /** Edge-to-edge: pad the root for status/nav bars and the keyboard. */
+    void applyInsets(View rootView) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(false);
+            rootView.setOnApplyWindowInsetsListener((v, ins) -> {
+                Insets sb = ins.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                Insets ime = ins.getInsets(WindowInsets.Type.ime());
+                v.setPadding(sb.left, sb.top, sb.right, Math.max(sb.bottom, ime.bottom));
+                return WindowInsets.CONSUMED;
+            });
+        } else {
+            rootView.setFitsSystemWindows(true);
+        }
+    }
 
     // ------------------------------------------------------------------ UI
 
@@ -653,18 +707,7 @@ public class LauncherActivity extends Activity {
         setContentView(root);
         getWindow().setStatusBarColor(0);
         getWindow().setNavigationBarColor(0);
-
-        if (Build.VERSION.SDK_INT >= 30) {
-            getWindow().setDecorFitsSystemWindows(false);
-            root.setOnApplyWindowInsetsListener((v, ins) -> {
-                Insets sb = ins.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                Insets ime = ins.getInsets(WindowInsets.Type.ime());
-                v.setPadding(sb.left, sb.top, sb.right, Math.max(sb.bottom, ime.bottom));
-                return WindowInsets.CONSUMED;
-            });
-        } else {
-            root.setFitsSystemWindows(true);
-        }
+        applyInsets(root);
         refreshKeys();
     }
 
@@ -996,7 +1039,7 @@ public class LauncherActivity extends Activity {
 
     private void switchSkin(String name) {
         prefs.edit().putString("skin", name.toUpperCase(Locale.US)).putBoolean("bootNext", true).apply();
-        hideKeyboard();
+        if (input != null) hideKeyboard();
         recreate();
     }
 
