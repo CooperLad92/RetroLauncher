@@ -1,5 +1,6 @@
 package com.cooperlad.retrolauncher;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -16,8 +17,15 @@ import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
-import android.graphics.drawable.GradientDrawable;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationManager;
 import android.net.Uri;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -25,6 +33,8 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.StatFs;
+import android.os.SystemClock;
+import android.provider.AlarmClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.Editable;
@@ -35,23 +45,23 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.AdapterView;
 import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.File;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -65,75 +75,69 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * RETRO-OS: an 80s home-computer / CRT terminal style Android home screen.
- * Apps are shown as a disk directory listing, you can type to filter or run
- * commands, F1-F4 are assignable quick-launch keys, and a CRT overlay adds
- * scanlines and a vignette.
+ * RETRO-OS: a skinnable retro Android home screen. Apps are listed in a
+ * scrolling list, you can type to filter or run commands, F1-F4 are
+ * assignable quick-launch keys, and each skin restyles the whole screen.
  */
 public class LauncherActivity extends Activity {
 
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
     private static final String[] F_DEFAULT = {"PHONE", "MSG", "WEB", "CAM"};
+    private static final int REQ_LOCATION = 7;
+    private static final long SAVER_AFTER_MS = 60_000;
 
-    private static final String HELP =
-            "COMMANDS:\n" +
-            " <NAME>      RUN BEST MATCH\n" +
-            " RUN <NAME>  LOAD A PROGRAM\n" +
-            " THEME [X]   " + RetroTheme.names() + "\n" +
-            " CRT         SCANLINES ON/OFF\n" +
-            " ICONS       PIXEL ICONS ON/OFF\n" +
-            " WEB <Q>     SEARCH THE WEB\n" +
-            " CALL <NUM>  DIAL A NUMBER\n" +
-            " SETTINGS    SYSTEM SETTINGS\n" +
-            " HOME        CHANGE LAUNCHER\n" +
-            " REBOOT      RUN BOOT SEQUENCE\n" +
-            "LONG-PRESS A PROGRAM FOR OPTIONS.";
+    static final class AppEntry {
+        String label; // upper case
+        String name;  // as the app names itself
+        ComponentName cn;
+        ResolveInfo ri;
+        int blocks;
+        int idx;
+    }
 
     // state
     private SharedPreferences prefs;
-    private RetroTheme theme;
+    private Skin skin;
     private Typeface font;
     private float fontScale = 1f;
+    private float density;
     private final Handler h = new Handler(Looper.getMainLooper());
     private final ExecutorService iconExec = Executors.newSingleThreadExecutor();
     private final Map<String, Bitmap> iconCache = new HashMap<>();
     private final Set<String> iconPending = new HashSet<>();
     private final List<AppEntry> allApps = new ArrayList<>();
     private final List<AppEntry> shown = new ArrayList<>();
-    private boolean appsDirty = true;
-    private int battery = -1;
-    private boolean charging;
+    private final Skin.Info info = new Skin.Info();
+    private boolean appsDirty = true, launching = false;
+    private int selected = -1;
+    private long lastTouch;
+    private int drainStartLevel = -1;
+    private long drainStartTime;
+    private SensorManager sensors;
+    private final float[] rotM = new float[9], orient = new float[3];
+    private long lastBearingUi;
 
     // views
     private FrameLayout root, screen, menuOverlay;
     private LinearLayout content;
-    private TextView titleBar, statusLine, clockView, dateView, responseView, dirHeader, dirFooter, promptView, bootView;
+    private TextView titleV, statusV, clockV, dateV, responseV, headerV, footerV, promptV, bootView;
+    private View saver;
     private EditText input;
     private ListView list;
-    private CrtOverlayView crt;
-    private final TextView[] fKeys = new TextView[5];
-    private final List<TextView> themed = new ArrayList<>();
-    private final List<TextView> reversed = new ArrayList<>();
+    private CrtOverlayView overlay;
+    private final TextView[] keys = new TextView[5];
     private AppAdapter adapter;
-
-    static final class AppEntry {
-        String label;
-        ComponentName cn;
-        ResolveInfo ri;
-        int blocks;
-    }
 
     // ------------------------------------------------------------------ lifecycle
 
     @Override protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        density = getResources().getDisplayMetrics().density;
         prefs = getSharedPreferences("retro", MODE_PRIVATE);
-        theme = RetroTheme.byName(prefs.getString("theme", "GREEN"));
-        if (theme == null) theme = RetroTheme.ALL[0];
-        font = loadFont();
+        skin = Skins.create(prefs.getString("skin", prefs.getString("theme", "GREEN")));
+        loadFont();
         buildUi();
-        applyTheme();
 
         IntentFilter pf = new IntentFilter();
         pf.addAction(Intent.ACTION_PACKAGE_ADDED);
@@ -142,8 +146,14 @@ public class LauncherActivity extends Activity {
         pf.addDataScheme("package");
         listen(packageReceiver, pf);
 
+        sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         loadApps();
-        if (saved == null) boot();
+        lastTouch = SystemClock.uptimeMillis();
+        if (saved == null || prefs.getBoolean("bootNext", false)) {
+            prefs.edit().remove("bootNext").apply();
+            boot();
+        }
+        if (skin.wantsLocation) requestLocationIfNeeded();
     }
 
     @Override protected void onResume() {
@@ -153,37 +163,51 @@ public class LauncherActivity extends Activity {
         refreshFooter();
         h.removeCallbacks(tick);
         h.post(tick);
-        crt.setRunning(true);
-        if (bootView == null) say("READY.");
+        overlay.setRunning(true);
+        if (skin.wantsLocation) {
+            startCompass();
+            updateLocation();
+        }
+        launching = false;
+        lastTouch = SystemClock.uptimeMillis();
+        if (bootView == null) say(skin.ready());
     }
 
     @Override protected void onPause() {
         super.onPause();
         try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) { }
         h.removeCallbacks(tick);
-        crt.setRunning(false);
+        overlay.setRunning(false);
+        if (sensors != null) sensors.unregisterListener(compass);
+        hideSaver();
     }
 
     @Override protected void onDestroy() {
         super.onDestroy();
         try { unregisterReceiver(packageReceiver); } catch (Exception ignored) { }
         iconExec.shutdownNow();
+        h.removeCallbacksAndMessages(null);
     }
 
     /** Home pressed while already home: reset to a clean prompt. */
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        hideSaver();
         dismissMenu();
         input.setText("");
         hideKeyboard();
         list.setSelection(0);
     }
 
-    @Override public void onBackPressed() {
-        // A launcher should never close on back.
-        if (menuOverlay != null) { dismissMenu(); return; }
-        if (input.length() > 0) { input.setText(""); return; }
-        hideKeyboard();
+    @Override public void onBackPressed() { goBack(); }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent ev) {
+        lastTouch = SystemClock.uptimeMillis();
+        if (saver != null) {
+            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) hideSaver();
+            return true;
+        }
+        return super.dispatchTouchEvent(ev);
     }
 
     /** System broadcasts only, but Android 13+ wants the export flag stated explicitly. */
@@ -203,148 +227,352 @@ public class LauncherActivity extends Activity {
         @Override public void onReceive(Context c, Intent i) {
             int lvl = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
             int scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-            battery = lvl < 0 ? -1 : Math.round(lvl * 100f / scale);
+            info.battery = lvl < 0 ? -1 : Math.round(lvl * 100f / scale);
             int st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-            charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+            info.charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+            estimateDrain();
             updateStatus();
         }
     };
 
+    /** Rough hours-remaining from the drain rate seen since the last unplug. */
+    private void estimateDrain() {
+        long now = SystemClock.elapsedRealtime();
+        if (info.charging || info.battery < 0) {
+            drainStartLevel = -1;
+            info.estHours = -1;
+        } else if (drainStartLevel < 0 || info.battery > drainStartLevel) {
+            drainStartLevel = info.battery;
+            drainStartTime = now;
+        } else {
+            float hrs = (now - drainStartTime) / 3_600_000f;
+            int drop = drainStartLevel - info.battery;
+            if (drop >= 2 && hrs > 0.05f) info.estHours = info.battery / (drop / hrs);
+        }
+    }
+
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             Date now = new Date();
-            String hm = new SimpleDateFormat("HH:mm", Locale.US).format(now);
-            if ((System.currentTimeMillis() / 1000) % 2 == 1) hm = hm.replace(':', ' ');
-            clockView.setText(hm);
-            dateView.setText(new SimpleDateFormat("EEE dd MMM yyyy", Locale.US).format(now).toUpperCase(Locale.US));
+            boolean blink = (System.currentTimeMillis() / 1000) % 2 == 1;
+            setIf(titleV, skin.title(info, now));
+            setIf(clockV, skin.clock(now, blink));
+            setIf(dateV, skin.date(now));
+            if (skin.wantsWifi) updateRssi();
+            updateStatus();
+            if (skin.dynamicKeys) refreshKeys();
+            checkSaver();
             h.postDelayed(this, 1000 - (System.currentTimeMillis() % 1000));
         }
     };
 
-    // ------------------------------------------------------------------ UI
+    private static void setIf(TextView t, String s) {
+        if (t != null && !TextUtils.equals(t.getText(), s)) t.setText(s);
+    }
 
-    private Typeface loadFont() {
+    // ------------------------------------------------------------------ sensors
+
+    private final SensorEventListener compass = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent e) {
+            SensorManager.getRotationMatrixFromVector(rotM, e.values);
+            SensorManager.getOrientation(rotM, orient);
+            info.bearing = (int) ((Math.toDegrees(orient[0]) + 360) % 360);
+            long now = SystemClock.uptimeMillis();
+            if (now - lastBearingUi > 250) {
+                lastBearingUi = now;
+                updateStatus();
+            }
+        }
+
+        @Override public void onAccuracyChanged(Sensor s, int a) { }
+    };
+
+    private void startCompass() {
+        if (sensors == null) return;
+        Sensor rv = sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        if (rv != null) sensors.registerListener(compass, rv, SensorManager.SENSOR_DELAY_UI);
+    }
+
+    private void requestLocationIfNeeded() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) return;
+        if (prefs.getBoolean("askedLocation", false)) return;
+        prefs.edit().putBoolean("askedLocation", true).apply();
+        requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_LOCATION);
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == REQ_LOCATION) updateLocation();
+    }
+
+    private void updateLocation() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return;
+        LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+        if (lm == null) return;
         try {
-            Typeface t = Typeface.createFromAsset(getAssets(), "fonts/retro.ttf");
-            fontScale = 1.15f;
-            return t;
+            Location best = null;
+            for (String p : lm.getProviders(true)) {
+                Location l = lm.getLastKnownLocation(p);
+                if (l != null && (best == null || l.getTime() > best.getTime())) best = l;
+            }
+            if (best != null) setGrid(best);
+            if (Build.VERSION.SDK_INT >= 30) {
+                String p = lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) ? LocationManager.NETWORK_PROVIDER
+                        : lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ? LocationManager.GPS_PROVIDER : null;
+                if (p != null) lm.getCurrentLocation(p, null, getMainExecutor(), l -> { if (l != null) setGrid(l); });
+            }
+        } catch (SecurityException | IllegalArgumentException ignored) { }
+    }
+
+    private void setGrid(Location l) {
+        info.grid = Mgrs.fromLatLon(l.getLatitude(), l.getLongitude());
+        updateStatus();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void updateRssi() {
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            WifiInfo wi = wm == null ? null : wm.getConnectionInfo();
+            info.rssi = wi == null ? -127 : wi.getRssi();
         } catch (Exception e) {
-            fontScale = 1f;
-            return Typeface.create(Typeface.MONOSPACE, Typeface.BOLD);
+            info.rssi = -127;
         }
     }
 
-    private int dp(float v) {
-        return Math.round(v * getResources().getDisplayMetrics().density);
+    // ------------------------------------------------------------------ helpers used by skins
+
+    Typeface font() { return font; }
+
+    float density() { return density; }
+
+    int dp(float v) { return Math.round(v * density); }
+
+    void addFx(View v) {
+        screen.addView(v, screen.indexOfChild(overlay), new FrameLayout.LayoutParams(MATCH, MATCH));
     }
 
-    private TextView text(float sp) {
+    void removeFx(View v, long delayMs) {
+        h.postDelayed(() -> screen.removeView(v), delayMs);
+    }
+
+    void moveSelection(int d) {
+        if (shown.isEmpty()) return;
+        int s = selected < 0 ? 0 : selected + d;
+        s = Math.max(0, Math.min(shown.size() - 1, s));
+        selected = s;
+        adapter.notifyDataSetChanged();
+        list.smoothScrollToPosition(s + list.getHeaderViewsCount());
+        AppEntry e = shown.get(s);
+        say(skin.selectText(e));
+        skin.onSelect(e);
+    }
+
+    void launchSelected() {
+        if (selected >= 0 && selected < shown.size()) launch(shown.get(selected));
+        else moveSelection(0);
+    }
+
+    void goBack() {
+        if (menuOverlay != null) { dismissMenu(); return; }
+        if (input.length() > 0) { input.setText(""); return; }
+        hideKeyboard();
+        list.setSelection(0);
+    }
+
+    void cycleSkin() { switchSkin(Skins.next(skin.name)); }
+
+    void openSystemMenu() { systemMenu(); }
+
+    // ------------------------------------------------------------------ UI
+
+    private void loadFont() {
+        switch (skin.font) {
+            case Skin.FONT_MONO:
+                font = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD);
+                fontScale = 1f;
+                break;
+            case Skin.FONT_SANS:
+                font = Typeface.create("sans-serif", Typeface.NORMAL);
+                fontScale = 0.95f;
+                break;
+            case Skin.FONT_CARTOON:
+                font = Typeface.create("casual", Typeface.BOLD);
+                fontScale = 1f;
+                break;
+            default:
+                try {
+                    font = Typeface.createFromAsset(getAssets(), "fonts/retro.ttf");
+                    fontScale = 1.15f;
+                } catch (Exception e) {
+                    font = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD);
+                    fontScale = 1f;
+                }
+        }
+    }
+
+    private TextView text(Skin.Part p) {
         TextView t = new TextView(this);
         t.setTypeface(font);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp * fontScale);
-        t.setLetterSpacing(0f);
-        style(t);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, skin.size(p) * fontScale);
+        t.setGravity(skin.gravity(p));
+        if (skin.upper && skin.font != Skin.FONT_PIXEL) t.setAllCaps(true);
+        paint(t, p);
         return t;
     }
 
-    private void style(TextView t) {
-        t.setTextColor(theme.fg);
-        t.setShadowLayer(dp(5), 0, 0, theme.withAlpha(0xB0)); // phosphor glow
+    private void paint(TextView t, Skin.Part p) {
+        t.setTextColor(skin.color(p));
+        Drawable b = skin.bg(p, density);
+        if (b != null) {
+            t.setBackground(b);
+            int[] pd = skin.pad(p);
+            t.setPadding(dp(pd[0]), dp(pd[1]), dp(pd[2]), dp(pd[3]));
+        }
+        skin.shadow(t, p, density);
     }
 
-    private TextView track(TextView t) { themed.add(t); return t; }
-
-    private TextView trackReversed(TextView t) { reversed.add(t); return t; }
+    private void add(LinearLayout parent, View v, int topMarginDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        lp.topMargin = dp(topMarginDp);
+        parent.addView(v, lp);
+    }
 
     private void buildUi() {
         root = new FrameLayout(this);
+        root.setBackgroundColor(skin.bezel);
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(outer, new FrameLayout.LayoutParams(MATCH, MATCH));
+
         screen = new FrameLayout(this);
-        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(MATCH, MATCH);
-        slp.setMargins(dp(6), dp(6), dp(6), dp(6));
-        root.addView(screen, slp);
+        screen.setBackground(skin.screenBg(density));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        int m = dp(skin.screenMarginDp);
+        slp.setMargins(m, m, m, skin.controlsOutside ? dp(6) : m);
+        outer.addView(screen, slp);
+
+        View bgv = skin.background(this);
+        if (bgv != null) screen.addView(bgv, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(16), dp(14), dp(16), dp(10));
+        int cp = dp(skin.contentPadDp);
+        content.setPadding(cp, skin.contentPadDp > 16 ? cp : dp(14), cp, skin.contentPadDp > 16 ? cp : dp(10));
         screen.addView(content, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-        titleBar = trackReversed(text(13));
-        titleBar.setGravity(Gravity.CENTER);
-        titleBar.setPadding(dp(4), dp(5), dp(4), dp(5));
-        titleBar.setText("**** RETRO-OS 64 BASIC V2 ****");
-        content.addView(titleBar, new LinearLayout.LayoutParams(MATCH, WRAP));
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        Drawable pb = skin.panelBg(density);
+        if (pb != null) {
+            panel.setBackground(pb);
+            panel.setPadding(dp(4), dp(4), dp(4), dp(6));
+        }
+        content.addView(panel, new LinearLayout.LayoutParams(MATCH, 0, 1f));
 
-        statusLine = track(text(12));
-        statusLine.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        lp.topMargin = dp(6);
-        content.addView(statusLine, lp);
+        titleV = text(Skin.Part.TITLE);
+        titleV.setSingleLine(true);
+        titleV.setEllipsize(TextUtils.TruncateAt.END);
+        if (skin.bg(Skin.Part.TITLE, density) == null) titleV.setPadding(dp(4), dp(5), dp(4), dp(5));
+        add(panel, titleV, 0);
 
-        clockView = track(text(64));
-        clockView.setGravity(Gravity.CENTER);
-        clockView.setOnClickListener(v -> openClock());
-        lp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        lp.topMargin = dp(14);
-        content.addView(clockView, lp);
+        statusV = text(Skin.Part.STATUS);
+        statusV.setMaxLines(2);
+        add(panel, statusV, 6);
 
-        dateView = track(text(14));
-        dateView.setGravity(Gravity.CENTER);
-        content.addView(dateView, new LinearLayout.LayoutParams(MATCH, WRAP));
+        clockV = text(Skin.Part.CLOCK);
+        clockV.setSingleLine(true);
+        clockV.setOnClickListener(v -> openClock());
+        add(panel, clockV, 10);
 
-        responseView = track(text(13));
-        responseView.setMaxLines(14);
-        lp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        lp.topMargin = dp(14);
-        content.addView(responseView, lp);
+        dateV = text(Skin.Part.DATE);
+        add(panel, dateV, 0);
+
+        responseV = text(Skin.Part.RESPONSE);
+        responseV.setMaxLines(14);
+        add(panel, responseV, 10);
 
         list = new ListView(this);
         list.setDivider(null);
         list.setVerticalScrollBarEnabled(false);
         list.setCacheColorHint(0);
         list.setBackgroundColor(0);
-        dirHeader = trackReversed(text(14));
-        dirHeader.setPadding(dp(4), dp(3), dp(4), dp(3));
-        dirHeader.setText("0 \"RETRO-OS DISK  \" 64 2A");
+        Drawable lb = skin.bg(Skin.Part.LIST, density);
+        if (lb != null) {
+            list.setBackground(lb);
+            list.setPadding(dp(4), dp(4), dp(4), dp(4));
+        }
+        list.setSelector(skin.listSelector());
+        headerV = text(Skin.Part.HEADER);
         LinearLayout headerWrap = new LinearLayout(this);
-        headerWrap.setPadding(0, dp(8), 0, dp(4));
-        headerWrap.addView(dirHeader, new LinearLayout.LayoutParams(WRAP, WRAP));
+        headerWrap.setPadding(0, dp(6), 0, dp(4));
+        headerWrap.addView(headerV, new LinearLayout.LayoutParams(WRAP, WRAP));
+        String hd = skin.header();
+        if (hd == null) headerV.setVisibility(View.GONE);
+        else headerV.setText(hd);
         list.addHeaderView(headerWrap, null, false);
-        dirFooter = track(text(14));
-        dirFooter.setPadding(0, dp(8), 0, dp(12));
-        list.addFooterView(dirFooter, null, false);
+        footerV = text(Skin.Part.FOOTER);
+        footerV.setPadding(dp(4), dp(8), dp(4), dp(12));
+        list.addFooterView(footerV, null, false);
         adapter = new AppAdapter();
         list.setAdapter(adapter);
-        list.setOnItemClickListener((p, v, pos, id) -> {
-            Object o = p.getItemAtPosition(pos);
-            if (o instanceof AppEntry) { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); launch((AppEntry) o); }
+        list.setOnItemClickListener((parent, v, pos, id) -> {
+            Object o = parent.getItemAtPosition(pos);
+            if (o instanceof AppEntry) {
+                v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                launch((AppEntry) o);
+            }
         });
-        list.setOnItemLongClickListener((p, v, pos, id) -> {
-            Object o = p.getItemAtPosition(pos);
+        list.setOnItemLongClickListener((parent, v, pos, id) -> {
+            Object o = parent.getItemAtPosition(pos);
             if (!(o instanceof AppEntry)) return false;
             v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
             appMenu((AppEntry) o);
             return true;
         });
-        content.addView(list, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        llp.topMargin = dp(6);
+        panel.addView(list, llp);
 
         // command line
         LinearLayout inRow = new LinearLayout(this);
         inRow.setOrientation(LinearLayout.HORIZONTAL);
         inRow.setGravity(Gravity.CENTER_VERTICAL);
-        inRow.setPadding(0, dp(6), 0, dp(6));
-        promptView = track(text(17));
-        promptView.setText("> ");
-        inRow.addView(promptView);
+        Drawable ib = skin.bg(Skin.Part.INPUT, density);
+        if (ib != null) {
+            inRow.setBackground(ib);
+            int[] pd = skin.pad(Skin.Part.INPUT);
+            inRow.setPadding(dp(pd[0]), dp(pd[1]), dp(pd[2]), dp(pd[3]));
+        } else {
+            inRow.setPadding(0, dp(6), 0, dp(6));
+        }
+        promptV = new TextView(this);
+        promptV.setTypeface(font);
+        promptV.setTextSize(TypedValue.COMPLEX_UNIT_SP, skin.size(Skin.Part.PROMPT) * fontScale);
+        promptV.setTextColor(skin.color(Skin.Part.PROMPT));
+        skin.shadow(promptV, Skin.Part.PROMPT, density);
+        promptV.setText(skin.prompt());
+        inRow.addView(promptV);
         input = new EditText(this);
         input.setTypeface(font);
-        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17 * fontScale);
+        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, skin.size(Skin.Part.INPUT) * fontScale);
         input.setBackground(null);
         input.setPadding(0, dp(4), 0, dp(4));
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                | (skin.upper ? InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS : 0) | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         input.setImeOptions(EditorInfo.IME_ACTION_GO | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
-        input.setHint("TYPE A PROGRAM OR HELP");
+        input.setHint(skin.hint());
+        int ic = skin.color(Skin.Part.INPUT);
+        input.setTextColor(ic);
+        input.setHintTextColor(Skin.alpha(ic, 0x70));
+        skin.shadow(input, Skin.Part.INPUT, density);
+        if (Build.VERSION.SDK_INT >= 29) {
+            android.graphics.drawable.GradientDrawable cur = new android.graphics.drawable.GradientDrawable();
+            cur.setColor(ic);
+            cur.setSize(dp(skin.font == Skin.FONT_PIXEL ? 10 : 2), dp(20));
+            input.setTextCursorDrawable(cur);
+        }
         input.setOnEditorActionListener((v, actionId, ev) -> {
             boolean enter = ev != null && ev.getKeyCode() == KeyEvent.KEYCODE_ENTER && ev.getAction() == KeyEvent.ACTION_DOWN;
             if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE || enter) {
@@ -359,35 +587,72 @@ public class LauncherActivity extends Activity {
             @Override public void afterTextChanged(Editable s) { filter(s.toString()); }
         });
         inRow.addView(input, new LinearLayout.LayoutParams(0, WRAP, 1f));
-        content.addView(inRow, new LinearLayout.LayoutParams(MATCH, WRAP));
+        add(panel, inRow, 6);
 
-        // function keys
+        // extra controls + function keys: inside the screen, or on the device body
+        LinearLayout controls;
+        if (skin.controlsOutside) {
+            controls = new LinearLayout(this);
+            controls.setOrientation(LinearLayout.VERTICAL);
+            controls.setPadding(dp(10), 0, dp(10), dp(8));
+            outer.addView(controls, new LinearLayout.LayoutParams(MATCH, WRAP));
+        } else {
+            controls = content;
+        }
+        View ex = skin.extra(this);
+        if (ex != null) {
+            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(MATCH, dp(skin.extraHeightDp));
+            elp.topMargin = dp(6);
+            controls.addView(ex, elp);
+        }
         LinearLayout dock = new LinearLayout(this);
         dock.setOrientation(LinearLayout.HORIZONTAL);
+        Drawable db = skin.bg(Skin.Part.DOCK, density);
+        if (db != null) {
+            dock.setBackground(db);
+            dock.setPadding(dp(3), dp(3), dp(3), dp(3));
+        }
+        final int[] actions = skin.keyActions();
         for (int i = 0; i < 5; i++) {
-            final int idx = i;
-            TextView k = track(text(11));
+            final int act = actions[i];
+            TextView k = text(Skin.Part.KEY);
             k.setGravity(Gravity.CENTER);
-            k.setLines(2);
+            k.setMaxLines(2);
+            k.setEllipsize(TextUtils.TruncateAt.END);
+            k.setBackground(skin.keyBg(i, density));
+            k.setTextColor(skin.keyColor(i));
             k.setPadding(dp(2), dp(8), dp(2), dp(8));
-            k.setOnClickListener(v -> { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); fKey(idx); });
-            k.setOnLongClickListener(v -> { fKeyLong(idx); return true; });
+            k.setOnClickListener(v -> {
+                v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                fKey(act);
+            });
+            k.setOnLongClickListener(v -> {
+                fKeyLong(act);
+                return true;
+            });
             LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(0, WRAP, 1f);
             kl.setMargins(dp(3), dp(4), dp(3), 0);
             dock.addView(k, kl);
-            fKeys[i] = k;
+            keys[i] = k;
         }
-        content.addView(dock, new LinearLayout.LayoutParams(MATCH, WRAP));
+        if (skin.show(Skin.Part.DOCK)) controls.addView(dock, new LinearLayout.LayoutParams(MATCH, WRAP));
 
-        crt = new CrtOverlayView(this);
-        crt.setEffectOn(prefs.getBoolean("crt", true));
-        screen.addView(crt, new FrameLayout.LayoutParams(MATCH, MATCH));
+        overlay = new CrtOverlayView(this);
+        overlay.configure(skin.fx, dp(skin.cornerDp), skin.bezel);
+        overlay.setEffectOn(prefs.getBoolean("crt", true));
+        screen.addView(overlay, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+        for (Skin.Part p : new Skin.Part[]{Skin.Part.TITLE, Skin.Part.STATUS, Skin.Part.CLOCK, Skin.Part.DATE, Skin.Part.RESPONSE}) {
+            if (!skin.show(p)) viewFor(p).setVisibility(View.GONE);
+        }
 
         // keep the keyboard closed on start
         content.setFocusableInTouchMode(true);
         content.requestFocus();
 
         setContentView(root);
+        getWindow().setStatusBarColor(0);
+        getWindow().setNavigationBarColor(0);
 
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
@@ -400,49 +665,22 @@ public class LauncherActivity extends Activity {
         } else {
             root.setFitsSystemWindows(true);
         }
+        refreshKeys();
     }
 
-    private void applyTheme() {
-        root.setBackgroundColor(theme.border);
-        screen.setBackground(theme.synthGrid
-                ? new SynthGridDrawable(theme.screen, theme.fg)
-                : new ColorDrawable(theme.screen));
-        getWindow().setStatusBarColor(0);
-        getWindow().setNavigationBarColor(0);
-        for (TextView t : themed) style(t);
-        for (TextView t : reversed) {
-            t.setTextColor(theme.screen);
-            t.setBackgroundColor(theme.fg);
-            t.setShadowLayer(0, 0, 0, 0);
+    private View viewFor(Skin.Part p) {
+        switch (p) {
+            case TITLE: return titleV;
+            case STATUS: return statusV;
+            case CLOCK: return clockV;
+            case DATE: return dateV;
+            default: return responseV;
         }
-        for (TextView k : fKeys) {
-            GradientDrawable g = new GradientDrawable();
-            g.setColor(theme.withAlpha(0x14));
-            g.setStroke(dp(2), theme.fg);
-            k.setBackground(g);
-        }
-        input.setTextColor(theme.fg);
-        input.setHintTextColor(theme.withAlpha(0x70));
-        input.setShadowLayer(dp(5), 0, 0, theme.withAlpha(0xB0));
-        if (Build.VERSION.SDK_INT >= 29) {
-            GradientDrawable cur = new GradientDrawable();
-            cur.setColor(theme.fg);
-            cur.setSize(dp(10), dp(20));
-            input.setTextCursorDrawable(cur);
-        }
-        list.setSelector(new ColorDrawable(theme.withAlpha(0x3A)));
-        crt.setBezelColor(theme.border);
-        iconCache.clear();
-        iconPending.clear();
-        adapter.notifyDataSetChanged();
-        updateStatus();
-        refreshDock();
     }
 
     private void updateStatus() {
-        String b = battery < 0 ? "--" : battery + "%";
-        statusLine.setText("BATT " + b + (charging ? " ⚡" : "") + "  ·  " + allApps.size() + " PROGRAMS  ·  "
-                + theme.name);
+        info.apps = allApps.size();
+        setIf(statusV, skin.status(info));
     }
 
     private void refreshFooter() {
@@ -451,12 +689,10 @@ public class LauncherActivity extends Activity {
             StatFs s = new StatFs(Environment.getDataDirectory().getPath());
             freeMb = s.getAvailableBytes() / (1024 * 1024);
         } catch (Exception ignored) { }
-        dirFooter.setText(freeMb + " BLOCKS FREE.");
+        footerV.setText(skin.footer(info, freeMb));
     }
 
-    private void say(String msg) {
-        responseView.setText(msg);
-    }
+    private void say(String msg) { responseV.setText(msg); }
 
     private void hideKeyboard() {
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
@@ -465,35 +701,44 @@ public class LauncherActivity extends Activity {
         content.requestFocus();
     }
 
+    // ------------------------------------------------------------------ screensaver
+
+    private void checkSaver() {
+        if (saver != null || bootView != null || menuOverlay != null) return;
+        if (SystemClock.uptimeMillis() - lastTouch < SAVER_AFTER_MS) return;
+        View v = skin.screensaver(this);
+        if (v == null) return;
+        hideKeyboard();
+        saver = v;
+        addFx(v);
+    }
+
+    private void hideSaver() {
+        if (saver != null) {
+            screen.removeView(saver);
+            saver = null;
+        }
+        lastTouch = SystemClock.uptimeMillis();
+    }
+
     // ------------------------------------------------------------------ boot
 
     private void boot() {
         if (bootView != null) return;
         dismissMenu();
-        bootView = text(14);
+        bootView = text(Skin.Part.BOOT);
         bootView.setPadding(dp(20), dp(24), dp(20), dp(20));
-        bootView.setGravity(Gravity.TOP | Gravity.START);
-        bootView.setBackgroundColor(theme.screen);
         bootView.setOnClickListener(v -> endBoot());
-        screen.addView(bootView, screen.indexOfChild(crt), new FrameLayout.LayoutParams(MATCH, MATCH));
+        addFx(bootView);
 
-        final String full =
-                "RETRO-OS BIOS V1.986\n" +
-                "(C) 1986 RETRO SYSTEMS INC.\n\n" +
-                "CPU 6502 @ 1.02 MHZ ...... OK\n" +
-                "MEMORY TEST 65536 BYTES .. OK\n" +
-                "DEVICE: " + Build.MODEL.toUpperCase(Locale.US) + "\n" +
-                "KERNAL ANDROID " + Build.VERSION.RELEASE + " ..... OK\n" +
-                "SCANNING DISK ......... " + allApps.size() + " PRG\n\n" +
-                "LOADING SHELL...\n\n" +
-                "READY.\n";
+        final String full = skin.boot(info);
         final int[] i = {0};
         Runnable step = new Runnable() {
             @Override public void run() {
-                if (bootView == null) return;
-                char c = full.charAt(i[0]);
+                if (bootView == null || full.isEmpty()) return;
+                char c = full.charAt(Math.min(i[0], full.length() - 1));
                 i[0] = Math.min(full.length(), i[0] + (c == '.' || c == '\n' ? 1 : 2));
-                bootView.setText(full.substring(0, i[0]) + "█");
+                bootView.setText(full.substring(0, i[0]) + (skin.font == Skin.FONT_PIXEL ? "█" : "_"));
                 if (i[0] < full.length()) {
                     h.postDelayed(this, c == '.' ? 45 : c == '\n' ? 140 : 14);
                 } else {
@@ -501,11 +746,16 @@ public class LauncherActivity extends Activity {
                 }
             }
         };
-        // CRT power-on: the picture snaps open from a horizontal line
-        screen.setScaleY(0.01f);
-        screen.setAlpha(0.4f);
-        screen.animate().scaleY(1f).alpha(1f).setDuration(420)
-                .setInterpolator(new DecelerateInterpolator(2f)).start();
+        if (skin.fx == Skin.Fx.CRT) {
+            // CRT power-on: the picture snaps open from a horizontal line
+            screen.setScaleY(0.01f);
+            screen.setAlpha(0.4f);
+            screen.animate().scaleY(1f).alpha(1f).setDuration(420)
+                    .setInterpolator(new DecelerateInterpolator(2f)).start();
+        } else {
+            screen.setAlpha(0f);
+            screen.animate().alpha(1f).setDuration(350).start();
+        }
         h.postDelayed(step, 450);
     }
 
@@ -513,7 +763,7 @@ public class LauncherActivity extends Activity {
         if (bootView == null) return;
         final View b = bootView;
         bootView = null;
-        say("READY.");
+        say(skin.ready());
         b.animate().alpha(0f).setDuration(220).withEndAction(() -> screen.removeView(b)).start();
     }
 
@@ -529,7 +779,8 @@ public class LauncherActivity extends Activity {
             if (ri.activityInfo.packageName.equals(getPackageName())) continue;
             AppEntry e = new AppEntry();
             CharSequence l = ri.loadLabel(pm);
-            e.label = (l == null ? ri.activityInfo.packageName : l.toString()).trim().toUpperCase(Locale.US);
+            e.name = (l == null ? ri.activityInfo.packageName : l.toString()).trim();
+            e.label = e.name.toUpperCase(Locale.US);
             e.cn = new ComponentName(ri.activityInfo.packageName, ri.activityInfo.name);
             e.ri = ri;
             try {
@@ -541,9 +792,10 @@ public class LauncherActivity extends Activity {
             allApps.add(e);
         }
         Collections.sort(allApps, (a, b) -> a.label.compareTo(b.label));
+        for (int k = 0; k < allApps.size(); k++) allApps.get(k).idx = k;
         filter(input.getText().toString());
         updateStatus();
-        refreshDock();
+        refreshKeys();
     }
 
     private String searchTerm(String raw) {
@@ -562,15 +814,17 @@ public class LauncherActivity extends Activity {
             else if (e.label.contains(term)) rest.add(e);
         }
         shown.addAll(rest);
+        selected = skin.cursor && !shown.isEmpty() ? 0 : -1;
         adapter.notifyDataSetChanged();
+        skin.onShown(shown);
+        if (selected == 0) skin.onSelect(shown.get(0));
     }
 
     private AppEntry best(String term) {
         if (term.isEmpty()) return null;
         AppEntry contains = null;
         for (AppEntry e : allApps) {
-            if (e.label.equals(term)) return e;
-            if (e.label.startsWith(term)) return e;
+            if (e.label.equals(term) || e.label.startsWith(term)) return e;
             if (contains == null && e.label.contains(term)) contains = e;
         }
         return contains;
@@ -583,17 +837,28 @@ public class LauncherActivity extends Activity {
     }
 
     private void launch(AppEntry e) {
-        Intent i = new Intent(Intent.ACTION_MAIN)
+        if (launching) return;
+        final Intent i = new Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
                 .setComponent(e.cn)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-        try {
-            say("LOAD \"" + e.label + "\",8,1\n\nSEARCHING FOR " + e.label + "\nLOADING\nREADY.");
-            startActivity(i);
-            input.setText("");
-            hideKeyboard();
-        } catch (Exception ex) {
-            say("?FILE NOT FOUND  ERROR\nREADY.");
+        say(skin.launchText(e));
+        input.setText("");
+        hideKeyboard();
+        Runnable go = () -> {
+            launching = false;
+            try {
+                startActivity(i);
+            } catch (Exception ex) {
+                say(skin.error("?FILE NOT FOUND  ERROR"));
+            }
+        };
+        long delay = skin.launchFx(this, e);
+        if (delay > 0) {
+            launching = true;
+            h.postDelayed(go, delay);
+        } else {
+            go.run();
         }
     }
 
@@ -603,16 +868,40 @@ public class LauncherActivity extends Activity {
             startActivity(i);
             return true;
         } catch (Exception ex) {
-            say(err + "\nREADY.");
+            say(skin.error(err));
             return false;
         }
     }
 
-    private void openClock() {
-        start(new Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS), "?DEVICE NOT PRESENT  ERROR");
+    private boolean startQuiet(Intent i) {
+        try {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
+    private void openClock() { start(new Intent(AlarmClock.ACTION_SHOW_ALARMS), "?DEVICE NOT PRESENT  ERROR"); }
+
     // ------------------------------------------------------------------ commands
+
+    private String help() {
+        return "COMMANDS:\n" +
+                " <NAME>      RUN BEST MATCH\n" +
+                " RUN <NAME>  LOAD A PROGRAM\n" +
+                " THEME [X]   CHANGE SKIN\n" +
+                " SKINS       LIST SKINS\n" +
+                " CRT         SCREEN EFFECT ON/OFF\n" +
+                " ICONS       ICONS ON/OFF\n" +
+                " WEB <Q>     SEARCH THE WEB\n" +
+                " CALL <NUM>  DIAL A NUMBER\n" +
+                " SETTINGS    SYSTEM SETTINGS\n" +
+                " HOME        CHANGE LAUNCHER\n" +
+                " REBOOT      RUN BOOT SEQUENCE\n" +
+                "LONG-PRESS A PROGRAM FOR OPTIONS.";
+    }
 
     private void runCommand(String raw) {
         String c = raw.trim().toUpperCase(Locale.US);
@@ -621,33 +910,42 @@ public class LauncherActivity extends Activity {
         String cmd = parts[0];
         String arg = parts.length > 1 ? parts[1].trim() : "";
         input.setText("");
+        if (c.matches("\\d{1,4}")) {
+            int idx = skin.numberToIndex(Integer.parseInt(c));
+            if (idx >= 0 && idx < allApps.size()) launch(allApps.get(idx));
+            else say(skin.error("?FILE NOT FOUND  ERROR"));
+            return;
+        }
         switch (cmd) {
             case "HELP": case "?":
-                say(HELP);
+                say(help());
                 break;
             case "LIST": case "DIR": case "CLS": case "CLEAR":
-                say("READY.");
+                say(skin.ready());
                 list.setSelection(0);
                 break;
-            case "THEME": case "COLOR": case "COLOUR": {
-                RetroTheme t = arg.isEmpty() ? theme.next() : RetroTheme.byName(arg);
-                if (t == null) { say("?ILLEGAL QUANTITY  ERROR\nTHEMES: " + RetroTheme.names() + "\nREADY."); break; }
-                applyRetroTheme(t);
-                say("THEME " + t.name + "\nREADY.");
+            case "SKINS":
+                say("SKINS:\n" + Skins.list() + "\n" + skin.ready());
+                break;
+            case "THEME": case "SKIN": case "COLOR": case "COLOUR": {
+                if (arg.isEmpty()) { cycleSkin(); break; }
+                if (!Skins.exists(arg)) { say(skin.error("?ILLEGAL QUANTITY  ERROR\nSKINS:\n" + Skins.list())); break; }
+                switchSkin(arg);
                 break;
             }
-            case "CRT": {
+            case "CRT": case "FX": {
                 boolean on = !prefs.getBoolean("crt", true);
                 prefs.edit().putBoolean("crt", on).apply();
-                crt.setEffectOn(on);
-                say("CRT " + (on ? "ON" : "OFF") + "\nREADY.");
+                overlay.setEffectOn(on);
+                overlay.setRunning(on);
+                say("SCREEN EFFECT " + (on ? "ON" : "OFF") + "\n" + skin.ready());
                 break;
             }
             case "ICONS": {
                 boolean on = !prefs.getBoolean("icons", true);
                 prefs.edit().putBoolean("icons", on).apply();
                 adapter.notifyDataSetChanged();
-                say("ICONS " + (on ? "ON" : "OFF") + "\nREADY.");
+                say("ICONS " + (on ? "ON" : "OFF") + "\n" + skin.ready());
                 break;
             }
             case "SETTINGS": case "SYS":
@@ -659,7 +957,7 @@ public class LauncherActivity extends Activity {
                 hideKeyboard();
                 break;
             case "WEB": case "SEARCH": {
-                if (arg.isEmpty()) { fKey(2); break; }
+                if (arg.isEmpty()) { fKey(Skin.K_F3); break; }
                 Intent w = new Intent(Intent.ACTION_WEB_SEARCH).putExtra("query", arg.toLowerCase(Locale.US));
                 if (!startQuiet(w)) start(new Intent(Intent.ACTION_VIEW,
                         Uri.parse("https://www.google.com/search?q=" + Uri.encode(arg))), "?NO BROWSER  ERROR");
@@ -675,46 +973,51 @@ public class LauncherActivity extends Activity {
                 boot();
                 break;
             case "TIME":
-                say(new SimpleDateFormat("HH:mm:ss  EEE dd MMM yyyy", Locale.US).format(new Date()).toUpperCase(Locale.US) + "\nREADY.");
+                say(Skin.fmt("HH:mm:ss  EEE dd MMM yyyy", new Date()) + "\n" + skin.ready());
                 break;
             case "ABOUT": case "VER":
-                say("RETRO-OS LAUNCHER V1.0\n" + Build.MANUFACTURER.toUpperCase(Locale.US) + " "
-                        + Build.MODEL.toUpperCase(Locale.US) + "\nANDROID " + Build.VERSION.RELEASE
-                        + " (API " + Build.VERSION.SDK_INT + ")\nREADY.");
+                say("RETRO-OS LAUNCHER V2.0  SKIN " + skin.name + "\n" + Build.MANUFACTURER.toUpperCase(Locale.US) + " "
+                        + Skin.model() + "\nANDROID " + Build.VERSION.RELEASE
+                        + " (API " + Build.VERSION.SDK_INT + ")\n" + skin.ready());
                 break;
             case "RUN": case "LOAD": {
                 AppEntry e = best(arg);
-                if (e != null) launch(e); else say("?FILE NOT FOUND  ERROR\nREADY.");
+                if (e != null) launch(e);
+                else say(skin.error("?FILE NOT FOUND  ERROR"));
                 break;
             }
             default: {
                 AppEntry e = best(c);
-                if (e != null) launch(e); else say("?SYNTAX  ERROR\nTYPE HELP FOR COMMANDS\nREADY.");
+                if (e != null) launch(e);
+                else say(skin.error("?SYNTAX  ERROR\nTYPE HELP FOR COMMANDS"));
             }
         }
     }
 
-    private boolean startQuiet(Intent i) {
-        try { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); return true; }
-        catch (Exception e) { return false; }
-    }
-
-    private void applyRetroTheme(RetroTheme t) {
-        theme = t;
-        prefs.edit().putString("theme", t.name).apply();
-        applyTheme();
+    private void switchSkin(String name) {
+        prefs.edit().putString("skin", name.toUpperCase(Locale.US)).putBoolean("bootNext", true).apply();
+        hideKeyboard();
+        recreate();
     }
 
     // ------------------------------------------------------------------ function keys
 
-    private void refreshDock() {
-        if (fKeys[0] == null) return;
-        for (int i = 0; i < 4; i++) {
-            AppEntry e = byComponent(prefs.getString("f" + i, null));
-            String label = e != null ? shorten(e.label, 6) : F_DEFAULT[i];
-            fKeys[i].setText("F" + (i + 1) + "\n" + label);
+    private void refreshKeys() {
+        if (keys[0] == null) return;
+        String[] labels = skin.keys(new Date());
+        int[] actions = skin.keyActions();
+        for (int i = 0; i < 5; i++) {
+            String label = labels[i];
+            int act = actions[i];
+            if (act >= Skin.K_F1 && act <= Skin.K_F4) {
+                AppEntry e = byComponent(prefs.getString("f" + act, null));
+                if (e != null) {
+                    int nl = label.indexOf('\n');
+                    label = (nl >= 0 ? label.substring(0, nl + 1) : "") + shorten(skin.label(e), 8);
+                }
+            }
+            setIf(keys[i], label);
         }
-        fKeys[4].setText("F5\nMENU");
     }
 
     private String shorten(String s, int n) {
@@ -722,31 +1025,33 @@ public class LauncherActivity extends Activity {
         return first.length() <= n ? first : first.substring(0, n);
     }
 
-    private void fKey(int i) {
-        if (i == 4) { systemMenu(); return; }
-        AppEntry e = byComponent(prefs.getString("f" + i, null));
+    private void fKey(int act) {
+        if (act == Skin.K_MENU) { systemMenu(); return; }
+        if (act == Skin.K_CLOCK) { openClock(); return; }
+        AppEntry e = byComponent(prefs.getString("f" + act, null));
         if (e != null) { launch(e); return; }
         Intent d;
-        switch (i) {
-            case 0: d = new Intent(Intent.ACTION_DIAL); break;
-            case 1: d = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MESSAGING); break;
-            case 2: d = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER); break;
+        switch (act) {
+            case Skin.K_F1: d = new Intent(Intent.ACTION_DIAL); break;
+            case Skin.K_F2: d = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MESSAGING); break;
+            case Skin.K_F3: d = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER); break;
             default: d = new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA); break;
         }
-        if (start(d, "?DEVICE NOT PRESENT  ERROR")) say("READY.");
+        if (start(d, "?DEVICE NOT PRESENT  ERROR")) say(skin.ready());
     }
 
-    private void fKeyLong(int i) {
-        if (i == 4) { systemMenu(); return; }
-        String cur = prefs.getString("f" + i, null);
+    private void fKeyLong(int act) {
+        if (act == Skin.K_MENU) { systemMenu(); return; }
+        if (act == Skin.K_CLOCK) { openClock(); return; }
+        String cur = prefs.getString("f" + act, null);
         if (cur == null) {
-            say("F" + (i + 1) + " = " + F_DEFAULT[i] + " (DEFAULT)\nLONG-PRESS A PROGRAM TO ASSIGN IT.\nREADY.");
+            say("F" + (act + 1) + " = " + F_DEFAULT[act] + " (DEFAULT)\nLONG-PRESS A PROGRAM TO ASSIGN IT.\n" + skin.ready());
             return;
         }
-        showMenu("F" + (i + 1) + " KEY", new String[]{"RESET TO " + F_DEFAULT[i], "CANCEL"}, pick -> {
+        showMenu("F" + (act + 1) + " KEY", new String[]{"RESET TO " + F_DEFAULT[act], "CANCEL"}, pick -> {
             if (pick == 0) {
-                prefs.edit().remove("f" + i).apply();
-                refreshDock();
+                prefs.edit().remove("f" + act).apply();
+                refreshKeys();
             }
         });
     }
@@ -762,8 +1067,8 @@ public class LauncherActivity extends Activity {
                 case 0: launch(e); break;
                 case 1: case 2: case 3: case 4:
                     prefs.edit().putString("f" + (pick - 1), e.cn.flattenToString()).apply();
-                    refreshDock();
-                    say("F" + pick + " = " + e.label + "\nREADY.");
+                    refreshKeys();
+                    say("F" + pick + " = " + e.label + "\n" + skin.ready());
                     break;
                 case 5:
                     start(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -773,30 +1078,40 @@ public class LauncherActivity extends Activity {
                     start(new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + e.cn.getPackageName())),
                             "?CAN'T DELETE  ERROR");
                     break;
+                default: break;
             }
         });
     }
 
     private void systemMenu() {
         String[] opts = {
-                "THEME: " + theme.name + " → " + theme.next().name,
-                "CRT EFFECT: " + (prefs.getBoolean("crt", true) ? "ON" : "OFF"),
-                "PIXEL ICONS: " + (prefs.getBoolean("icons", true) ? "ON" : "OFF"),
+                "SKIN: " + skin.name + "  → CHANGE",
+                "SCREEN EFFECT: " + (prefs.getBoolean("crt", true) ? "ON" : "OFF"),
+                "ICONS: " + (prefs.getBoolean("icons", true) ? "ON" : "OFF"),
                 "SYSTEM SETTINGS",
                 "CHOOSE DEFAULT LAUNCHER",
                 "REBOOT",
                 "HELP"};
         showMenu("SYSTEM MENU", opts, pick -> {
             switch (pick) {
-                case 0: runCommand("THEME"); break;
+                case 0: skinMenu(); break;
                 case 1: runCommand("CRT"); break;
                 case 2: runCommand("ICONS"); break;
                 case 3: runCommand("SETTINGS"); break;
                 case 4: runCommand("HOME"); break;
                 case 5: runCommand("REBOOT"); break;
                 case 6: runCommand("HELP"); break;
+                default: break;
             }
         });
+    }
+
+    private void skinMenu() {
+        String[] opts = new String[Skins.NAMES.length];
+        for (int i = 0; i < opts.length; i++) {
+            opts[i] = Skins.NAMES[i] + (Skins.NAMES[i].equals(skin.name) ? "  ◀" : "");
+        }
+        showMenu("SELECT SKIN", opts, pick -> switchSkin(Skins.NAMES[pick]));
     }
 
     private void showMenu(String title, String[] opts, MenuPick cb) {
@@ -810,44 +1125,41 @@ public class LauncherActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setClickable(true);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(theme.screen);
-        bg.setStroke(dp(2), theme.fg);
-        box.setBackground(bg);
+        box.setBackground(skin.menuBg(density));
         box.setPadding(dp(16), dp(14), dp(16), dp(10));
 
-        TextView t = text(14);
-        t.setText(" " + title + " ");
+        TextView t = text(Skin.Part.TITLE);
+        t.setText(title);
         t.setSingleLine(true);
         t.setEllipsize(TextUtils.TruncateAt.END);
-        t.setTextColor(theme.screen);
-        t.setBackgroundColor(theme.fg);
-        t.setShadowLayer(0, 0, 0, 0);
-        t.setPadding(dp(4), dp(4), dp(4), dp(4));
+        if (skin.bg(Skin.Part.TITLE, density) == null) t.setPadding(dp(4), dp(4), dp(4), dp(4));
         box.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
 
+        ScrollView sv = new ScrollView(this);
+        LinearLayout items = new LinearLayout(this);
+        items.setOrientation(LinearLayout.VERTICAL);
+        sv.addView(items, new FrameLayout.LayoutParams(MATCH, WRAP));
         for (int i = 0; i < opts.length; i++) {
             final int idx = i;
-            TextView o = text(15);
+            TextView o = text(Skin.Part.MENU);
             o.setText((i + 1) + ". " + opts[i]);
             o.setPadding(dp(4), dp(11), dp(4), dp(11));
-            GradientDrawable press = new GradientDrawable();
-            press.setColor(theme.withAlpha(0x3A));
             android.graphics.drawable.StateListDrawable sl = new android.graphics.drawable.StateListDrawable();
-            sl.addState(new int[]{android.R.attr.state_pressed}, press);
+            sl.addState(new int[]{android.R.attr.state_pressed}, new ColorDrawable(Skin.alpha(skin.color(Skin.Part.MENU), 0x3A)));
             o.setBackground(sl);
             o.setOnClickListener(v -> {
                 v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                 dismissMenu();
                 cb.pick(idx);
             });
-            box.addView(o, new LinearLayout.LayoutParams(MATCH, WRAP));
+            items.addView(o, new LinearLayout.LayoutParams(MATCH, WRAP));
         }
+        box.addView(sv, new LinearLayout.LayoutParams(MATCH, WRAP));
 
         FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER);
-        bl.setMargins(dp(24), dp(24), dp(24), dp(24));
+        bl.setMargins(dp(24), dp(40), dp(24), dp(40));
         ov.addView(box, bl);
-        screen.addView(ov, screen.indexOfChild(crt), new FrameLayout.LayoutParams(MATCH, MATCH));
+        addFx(ov);
         menuOverlay = ov;
     }
 
@@ -858,11 +1170,12 @@ public class LauncherActivity extends Activity {
         }
     }
 
-    // ------------------------------------------------------------------ list + pixel icons
+    // ------------------------------------------------------------------ list + icons
 
     private static final class Row {
+        LinearLayout row;
         ImageView icon;
-        TextView name, type;
+        TextView name, tail;
     }
 
     private final class AppAdapter extends BaseAdapter {
@@ -873,39 +1186,50 @@ public class LauncherActivity extends Activity {
         @Override public View getView(int pos, View cv, ViewGroup parent) {
             Row r;
             if (cv == null) {
-                LinearLayout row = new LinearLayout(LauncherActivity.this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(0, dp(7), 0, dp(7));
+                FrameLayout outer = new FrameLayout(LauncherActivity.this);
+                int g = dp(skin.rowGapDp());
+                outer.setPadding(dp(2), g, dp(2), g);
                 r = new Row();
+                r.row = new LinearLayout(LauncherActivity.this);
+                r.row.setOrientation(LinearLayout.HORIZONTAL);
+                r.row.setGravity(Gravity.CENTER_VERTICAL);
+                outer.addView(r.row, new FrameLayout.LayoutParams(MATCH, WRAP));
                 r.icon = new ImageView(LauncherActivity.this);
                 r.icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                LinearLayout.LayoutParams il = new LinearLayout.LayoutParams(dp(24), dp(24));
+                LinearLayout.LayoutParams il = new LinearLayout.LayoutParams(dp(skin.iconDp), dp(skin.iconDp));
                 il.rightMargin = dp(10);
-                row.addView(r.icon, il);
-                r.name = text(15);
+                r.row.addView(r.icon, il);
+                r.name = text(Skin.Part.ROW);
                 r.name.setSingleLine(true);
                 r.name.setEllipsize(TextUtils.TruncateAt.END);
-                row.addView(r.name, new LinearLayout.LayoutParams(0, WRAP, 1f));
-                r.type = text(15);
-                row.addView(r.type);
-                row.setTag(r);
-                cv = row;
+                r.row.addView(r.name, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                r.tail = text(Skin.Part.TAIL);
+                r.tail.setSingleLine(true);
+                r.row.addView(r.tail);
+                outer.setTag(r);
+                cv = outer;
             } else {
                 r = (Row) cv.getTag();
             }
             AppEntry e = shown.get(pos);
-            style(r.name);
-            style(r.type);
-            r.name.setText(String.format(Locale.US, "%-4d\"%s\"", e.blocks, e.label));
-            r.type.setText(" PRG");
+            boolean sel = pos == selected;
+            r.row.setBackground(skin.rowBg(e.idx, sel, density));
+            int rp = dp(skin.rowPadDp());
+            r.row.setPadding(rp, dp(7), rp, dp(7));
+            r.name.setText(skin.row(e, sel));
+            r.name.setTextColor(skin.rowColor(e.idx, sel));
+            String tail = skin.tail(e);
+            r.tail.setVisibility(tail.isEmpty() ? View.GONE : View.VISIBLE);
+            r.tail.setText(tail);
+            r.tail.setTextColor(skin.tailColor(e.idx, sel));
+            cv.setRotation(skin.rowRotation(e.idx));
             bindIcon(r.icon, e);
             return cv;
         }
     }
 
     private void bindIcon(ImageView iv, AppEntry e) {
-        if (!prefs.getBoolean("icons", true)) {
+        if (skin.icons == Skin.Icons.NONE || !prefs.getBoolean("icons", true)) {
             iv.setVisibility(View.GONE);
             return;
         }
@@ -914,36 +1238,59 @@ public class LauncherActivity extends Activity {
         iv.setTag(key);
         Bitmap b = iconCache.get(key);
         if (b != null) {
-            iv.setImageDrawable(pixelDrawable(b));
+            iv.setImageDrawable(iconDrawable(b));
             return;
         }
         iv.setImageDrawable(null);
         if (!iconPending.add(key)) return;
-        final int fg = theme.fg;
+        final Skin s = skin;
         final ResolveInfo ri = e.ri;
+        final String label = e.label;
         final PackageManager pm = getPackageManager();
+        final int realPx = dp(s.iconDp);
         iconExec.execute(() -> {
             Bitmap bm;
-            try { bm = pixelate(ri.loadIcon(pm), fg); } catch (Exception ex) { bm = null; }
+            try {
+                bm = makeIcon(s, ri, label, pm, realPx);
+            } catch (Exception ex) {
+                bm = null;
+            }
             final Bitmap res = bm;
             h.post(() -> {
                 iconPending.remove(key);
-                if (res == null || fg != theme.fg) return; // theme changed meanwhile
+                if (res == null || s != skin) return;
                 iconCache.put(key, res);
                 adapter.notifyDataSetChanged();
             });
         });
     }
 
-    private BitmapDrawable pixelDrawable(Bitmap b) {
+    private BitmapDrawable iconDrawable(Bitmap b) {
         BitmapDrawable d = new BitmapDrawable(getResources(), b);
-        d.setFilterBitmap(false); // keep hard pixel edges when scaled up
-        d.setAntiAlias(false);
+        boolean smooth = skin.icons == Skin.Icons.REAL;
+        d.setFilterBitmap(smooth); // pixel icons keep hard edges when scaled up
+        d.setAntiAlias(smooth);
         return d;
     }
 
-    /** Renders the app icon at 16x16 and remaps it to 4 shades of the phosphor colour. */
-    private static Bitmap pixelate(Drawable d, int fg) {
+    private static Bitmap makeIcon(Skin s, ResolveInfo ri, String label, PackageManager pm, int realPx) {
+        switch (s.icons) {
+            case CRITTER:
+                return FxViews.critter(label);
+            case REAL: {
+                Drawable d = ri.loadIcon(pm);
+                Bitmap b = Bitmap.createBitmap(realPx, realPx, Bitmap.Config.ARGB_8888);
+                d.setBounds(0, 0, realPx, realPx);
+                d.draw(new Canvas(b));
+                return b;
+            }
+            default:
+                return pixelate(ri.loadIcon(pm), s.palette());
+        }
+    }
+
+    /** Renders the app icon at 16x16 and remaps it to the skin's four shades. */
+    private static Bitmap pixelate(Drawable d, int[] pal) {
         final int n = 16;
         Bitmap small = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(small);
@@ -951,14 +1298,14 @@ public class LauncherActivity extends Activity {
         d.draw(c);
         int[] px = new int[n * n];
         small.getPixels(px, 0, n, 0, 0, n, n);
-        int fr = (fg >> 16) & 0xFF, fgG = (fg >> 8) & 0xFF, fb = fg & 0xFF;
         for (int i = 0; i < px.length; i++) {
             int p = px[i];
-            int a = (p >>> 24);
-            if (a < 110) { px[i] = 0; continue; }
+            if ((p >>> 24) < 110) {
+                px[i] = 0;
+                continue;
+            }
             float lum = (0.299f * ((p >> 16) & 0xFF) + 0.587f * ((p >> 8) & 0xFF) + 0.114f * (p & 0xFF)) / 255f;
-            float lv = lum > 0.75f ? 1f : lum > 0.5f ? 0.72f : lum > 0.25f ? 0.45f : 0.22f;
-            px[i] = 0xFF000000 | ((int) (fr * lv) << 16) | ((int) (fgG * lv) << 8) | (int) (fb * lv);
+            px[i] = pal[lum > 0.75f ? 3 : lum > 0.5f ? 2 : lum > 0.25f ? 1 : 0];
         }
         small.setPixels(px, 0, n, 0, 0, n, n);
         return small;
